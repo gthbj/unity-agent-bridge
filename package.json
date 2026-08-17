@@ -1,0 +1,8 @@
+{
+  "name": "com.gthbj.agent-bridge",
+  "displayName": "Unity Agent Bridge",
+  "version": "0.1.0",
+  "unity": "2022.3",
+  "description": "Batchmode capture (and later: resident editor service) for coding agents driving Unity/Tuanjie projects. Verified envelope: Tuanjie 2022.3.62t10, built-in render pipeline, uGUI ScreenSpaceOverlay, macOS/Metal. See Docs~/EVIDENCE.md.",
+  "author": { "name": "gthbj" }
+}
