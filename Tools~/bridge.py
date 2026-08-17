@@ -20,8 +20,10 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import time
 import tempfile
 
 PKG_NAME = "com.gthbj.agent-bridge"
@@ -86,6 +88,21 @@ def check_package(project: str) -> None:
         )
 
 
+PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+
+
+def png_dimensions(path: str):
+    """Return (w, h) from the IHDR chunk, or None if this is not a usable PNG."""
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(24)
+    except OSError:
+        return None
+    if len(head) < 24 or not head.startswith(PNG_MAGIC) or head[12:16] != b"IHDR":
+        return None
+    return int.from_bytes(head[16:20], "big"), int.from_bytes(head[20:24], "big")
+
+
 def capture(args: argparse.Namespace) -> int:
     project = os.path.abspath(args.project)
     out = os.path.abspath(args.out)
@@ -93,12 +110,19 @@ def capture(args: argparse.Namespace) -> int:
     check_package(project)
 
     log = args.log or os.path.join(tempfile.gettempdir(), "agent_bridge_capture.log")
+
+    # Everything the editor writes goes to a fresh directory owned by THIS call.
+    # Reusing --out directly is how a previous run's PNG gets reported as this
+    # run's success -- the exact silent false-green this tool exists to prevent.
+    workdir = tempfile.mkdtemp(prefix="agent-bridge-")
+    staged = os.path.join(workdir, "capture.png")
+
     cmd = [
         editor,
         "-batchmode",  # deliberately NOT -nographics: capture needs a real GPU
         "-projectPath", project,
         "-executeMethod", "AgentBridge.Editor.BridgeCapture.Run",
-        "-abOut", out,
+        "-abOut", staged,
         "-abWidth", str(args.width),
         "-abHeight", str(args.height),
         "-abSettleFrames", str(args.settle_frames),
@@ -116,35 +140,84 @@ def capture(args: argparse.Namespace) -> int:
     print(f"[bridge] editor : {editor}")
     print(f"[bridge] project: {project}")
     print(f"[bridge] log    : {log}")
-    # Outer timeout: editor-side watchdog plus cold-start / import headroom.
     outer = args.timeout + 300
     try:
-        proc = subprocess.run(cmd, timeout=outer, check=False)
-        code = proc.returncode
+        code = subprocess.run(cmd, timeout=outer, check=False).returncode
     except subprocess.TimeoutExpired:
         print(f"[bridge] FAIL: no exit within {outer}s (outer timeout); editor killed")
-        return 4
+        return finish_failure(4, out, workdir, log, tail=False)
+    except OSError as e:
+        print(f"[bridge] FAIL: could not run editor: {e}")
+        return finish_failure(6, out, workdir, log, tail=False)
 
-    meaning = EXIT_MEANINGS.get(code, "unknown")
-    result_path = out + ".json"
-    if os.path.isfile(result_path):
+    ok, reason = validate_run(code, staged, args)
+    if not ok:
+        meaning = EXIT_MEANINGS.get(code, "unknown")
+        print(f"[bridge] FAIL: {reason} (editor exit {code}: {meaning})")
+        return finish_failure(code if code != 0 else 5, out, workdir, log)
+
+    try:
+        os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+        os.replace(staged, out)
+        result_src = staged + ".json"
+        if os.path.isfile(result_src):
+            os.replace(result_src, out + ".json")
+    except OSError as e:
+        print(f"[bridge] FAIL: could not move capture into place: {e}")
+        return finish_failure(15, out, workdir, log, tail=False)
+
+    shutil.rmtree(workdir, ignore_errors=True)
+    w, h = png_dimensions(out)
+    print(f"[bridge] OK: {out} ({w}x{h})")
+    return 0
+
+
+def validate_run(code: int, staged: str, args: argparse.Namespace):
+    """A run counts as successful only if THIS call produced a matching PNG."""
+    if code != 0:
+        return False, "editor reported failure"
+
+    result_path = staged + ".json"
+    if not os.path.isfile(result_path):
+        return False, "editor exited 0 but wrote no result JSON"
+    try:
+        with open(result_path, encoding="utf-8") as fh:
+            result = json.load(fh)
+    except (OSError, json.JSONDecodeError) as e:
+        return False, f"result JSON unreadable ({e})"
+
+    print(f"[bridge] result : {json.dumps(result, ensure_ascii=False)}")
+    if result.get("ok") is not True or result.get("exitCode") != 0:
+        return False, "result JSON does not report success"
+    if result.get("width") != args.width or result.get("height") != args.height:
+        return False, (f"result JSON size {result.get('width')}x{result.get('height')} "
+                       f"!= requested {args.width}x{args.height}")
+    if args.scene and result.get("scene") != args.scene:
+        return False, f"result JSON scene {result.get('scene')!r} != requested {args.scene!r}"
+
+    if not os.path.isfile(staged):
+        return False, "result JSON claims success but no PNG was written"
+    dims = png_dimensions(staged)
+    if dims is None:
+        return False, "staged file is not a valid PNG"
+    if dims != (args.width, args.height):
+        return False, f"PNG is {dims[0]}x{dims[1]}, expected {args.width}x{args.height}"
+    return True, ""
+
+
+def finish_failure(code: int, out: str, workdir: str, log: str, tail: bool = True) -> int:
+    """Clean up this call's artifacts and make any stale --out impossible to mistake."""
+    shutil.rmtree(workdir, ignore_errors=True)
+    if os.path.exists(out):
         try:
-            with open(result_path, encoding="utf-8") as fh:
-                print(f"[bridge] result : {fh.read().strip()}")
+            age = time.time() - os.path.getmtime(out)
+            when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(out)))
         except OSError:
-            pass
-
-    if code == 0 and os.path.isfile(out):
-        print(f"[bridge] OK: {out}")
-        return 0
-    if code == 0:
-        # Belt and braces: a zero exit without a file is exactly the silent-failure
-        # class the editor side is built to prevent. Never report it as success.
-        print(f"[bridge] FAIL: editor exited 0 but {out} does not exist")
-        return 5
-
-    print(f"[bridge] FAIL: exit {code} ({meaning})")
-    tail_log(log)
+            age, when = -1, "unknown"
+        print(f"[bridge] NOTE: {out} was NOT updated. It is a PREVIOUS capture "
+              f"from {when} ({age / 60:.0f} min ago) -- do not read it as this run's result.")
+    if tail:
+        tail_log(log)
     return code
 
 

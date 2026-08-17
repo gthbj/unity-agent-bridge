@@ -18,11 +18,17 @@
 
 ## 用法
 
-1. 目标项目 `Packages/manifest.json` 加依赖（本工具**不会**替你改 manifest）：
+1. 目标项目 `Packages/manifest.json` 加依赖（本工具**不会**替你改 manifest），**必须钉 commit SHA**：
 
 ```json
-"com.gthbj.agent-bridge": "file:/ABSOLUTE/PATH/unity-agent-bridge"
+"com.gthbj.agent-bridge": "git+ssh://git@github.com/gthbj/unity-agent-bridge.git#<commit-sha>"
 ```
+
+🔴 **不要用 `file:` 本地路径**。本地路径是可变来源：宿主工程的 lock 文件只记路径、不记内容，于是
+同一个宿主 commit 会随本仓 HEAD 漂移——宿主自己没有 diff，它的门禁也就不会重跑，**已有的
+「Editor-only 未漏进 Player」证据会静默过期**。相对路径还会在非同级目录的检出下解析到别处
+（`/tmp/x/Packages/../..` → `/private/tmp`）。钉 SHA 让指针进入宿主 diff，升级时宿主门禁自然重跑——
+那不是税，那就是这条证据继续成立的方式。
 
 2. 截图：
 
