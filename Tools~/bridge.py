@@ -127,6 +127,8 @@ def validate_png(path: str, expect_w: int, expect_h: int):
     dims = None
     seen_idat = seen_iend = False
     first = True
+    idat = bytearray()
+    ihdr_body = b""
     while pos < len(data):
         if pos + 8 > len(data):
             return None, f"truncated chunk header at byte {pos}"
@@ -143,9 +145,11 @@ def validate_png(path: str, expect_w: int, expect_h: int):
             if ctype != b"IHDR" or length != 13:
                 return None, "first chunk is not a 13-byte IHDR"
             dims = (int.from_bytes(body[0:4], "big"), int.from_bytes(body[4:8], "big"))
+            ihdr_body = body
             first = False
         elif ctype == b"IDAT":
             seen_idat = True
+            idat += body
         pos = body_end + 4
         if ctype == b"IEND":
             seen_iend = True
@@ -159,6 +163,26 @@ def validate_png(path: str, expect_w: int, expect_h: int):
         return None, "no IDAT chunk"
     if dims != (expect_w, expect_h):
         return None, f"PNG is {dims[0]}x{dims[1]}, expected {expect_w}x{expect_h}"
+
+    # Chunk framing being intact says nothing about the pixels. An empty or
+    # truncated-but-correctly-CRC'd IDAT is a structurally perfect, undecodable image.
+    depth, color, comp, filt, interlace = ihdr_body[8:13]
+    if (depth, color, comp, filt, interlace) != (8, 6, 0, 0, 0):
+        return None, (f"unsupported IHDR (depth={depth} color={color} comp={comp} "
+                      f"filter={filt} interlace={interlace}); expected 8-bit RGBA, non-interlaced")
+    try:
+        d = zlib.decompressobj()
+        raw = d.decompress(bytes(idat))
+        raw += d.flush()
+    except zlib.error as e:
+        return None, f"IDAT is not a decodable zlib stream ({e})"
+    if not d.eof:
+        return None, "IDAT zlib stream is incomplete or truncated"
+    if d.unused_data:
+        return None, f"{len(d.unused_data)} bytes of trailing data after the IDAT zlib stream"
+    expect_len = expect_h * (1 + expect_w * 4)
+    if len(raw) != expect_len:
+        return None, f"decoded {len(raw)} bytes, expected {expect_len} for {expect_w}x{expect_h} RGBA"
     return dims, ""
 
 
@@ -358,8 +382,17 @@ def build_bad_pngs(w: int, h: int):
     good = PNG_MAGIC + ihdr + idat + iend
     bad_crc = bytearray(good)
     bad_crc[-5] ^= 0xFF
+    empty_idat = chunk(b"IDAT", b"")
+    short_idat = chunk(b"IDAT", zlib.compress(raw)[:-1])
     return {
         "empty": b"",
+        "empty IDAT (chunk-valid, undecodable)": PNG_MAGIC + ihdr + empty_idat + iend,
+        "truncated zlib tail in IDAT": PNG_MAGIC + ihdr + short_idat + iend,
+        "IDAT decodes short (wrong pixel count)":
+            PNG_MAGIC + ihdr + chunk(b"IDAT", zlib.compress(raw[: len(raw) // 2])) + iend,
+        "16-bit depth (unsupported IHDR)": PNG_MAGIC + chunk(
+            b"IHDR", w.to_bytes(4, "big") + h.to_bytes(4, "big") + bytes([16, 6, 0, 0, 0])
+        ) + idat + iend,
         "24-byte stub (the exact reported bypass)":
             PNG_MAGIC + (13).to_bytes(4, "big") + b"IHDR"
             + w.to_bytes(4, "big") + h.to_bytes(4, "big"),

@@ -44,7 +44,13 @@ python3 Tools~/bridge.py capture --project /path/to/project --out /tmp/shot.png
 python3 Tools~/bridge.py selftest
 ```
 
-不需要 Unity。把「结构上不是有效截图」的各种形态固化成回归：空文件、**24 字节 stub**（只有签名 + IHDR 头，评审实证能骗过只看前 24 字节的校验）、IHDR 后截断、缺 IDAT、缺 IEND、IEND 后有尾随字节、坏 CRC、尺寸不符。
+不需要 Unity。把「结构上不是有效截图」的各种形态固化成回归（容器层与像素流层都覆盖）：空文件、**24 字节 stub**（只有签名 + IHDR 头，评审实证能骗过只看前 24 字节的校验）、IHDR 后截断、缺 IDAT、缺 IEND、IEND 后有尾随字节、坏 CRC、尺寸不符，以及**容器完全合法但像素流不可解码**的三种——空 IDAT、zlib 尾被截断、解压长度不符。
+
+🔴 后三种是关键：chunk 边界和 CRC 全对**不代表图能读**。只验容器层会把「本次生成了一张打不开的图」报成成功。
+
+## 客户端也必须钉版本
+
+包钉了 SHA，但驱动它的 `Tools~/bridge.py` 是工作副本里的普通脚本——**停在旧提交或本地有改动，同一个宿主 commit 就会跑到不同的客户端代码**，正是钉 SHA 要消除的那种漂移。宿主应通过从 git 对象取出钉住那版脚本来调用（arrows 的做法见其 `tools/agent_capture.py`），不要直接执行工作副本。
 
 ## 退出码
 
