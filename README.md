@@ -38,6 +38,14 @@ python3 Tools~/bridge.py capture --project /path/to/project --out /tmp/shot.png
 
 不传 `--scene` 时用 Build Settings 里第一个启用场景。`--setup-method Ns.Type.StaticMethod`（可带 `--setup-arg`）在开拍前调一个项目侧静态钩子（选关、换主题等），钩子由各项目自己提供。
 
+## 自检
+
+```bash
+python3 Tools~/bridge.py selftest
+```
+
+不需要 Unity。把「结构上不是有效截图」的各种形态固化成回归：空文件、**24 字节 stub**（只有签名 + IHDR 头，评审实证能骗过只看前 24 字节的校验）、IHDR 后截断、缺 IDAT、缺 IEND、IEND 后有尾随字节、坏 CRC、尺寸不符。
+
 ## 退出码
 
 | 码 | 含义 |

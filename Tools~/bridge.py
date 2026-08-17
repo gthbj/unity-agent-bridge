@@ -25,6 +25,7 @@ import subprocess
 import sys
 import time
 import tempfile
+import zlib
 
 PKG_NAME = "com.gthbj.agent-bridge"
 
@@ -72,7 +73,18 @@ def find_editor(project: str, override: str) -> str:
     )
 
 
+PINNED_HINT = (
+    f'  "{PKG_NAME}": "git+ssh://git@github.com/gthbj/unity-agent-bridge.git#<40-hex-sha>"'
+)
+
+
 def check_package(project: str) -> None:
+    """Require the host to depend on a SHA-pinned git package.
+
+    A `file:` local path is deliberately rejected: the lock records only the path,
+    never the content, so the same host commit silently changes behaviour as this
+    repo moves -- and the host's own gates never re-run because it has no diff.
+    """
     manifest = os.path.join(project, "Packages", "manifest.json")
     try:
         with open(manifest, encoding="utf-8") as fh:
@@ -80,27 +92,74 @@ def check_package(project: str) -> None:
     except (OSError, json.JSONDecodeError) as e:
         sys.exit(f"cannot read {manifest}: {e}")
     if PKG_NAME not in deps:
-        sys.exit(
-            f"{PKG_NAME} is not in {manifest}.\n"
-            f'Add it yourself (this client never edits your manifest):\n'
-            f'  "{PKG_NAME}": "file:/ABSOLUTE/PATH/TO/unity-agent-bridge"\n'
-            f'  or a git URL once the repo is pushed.'
-        )
+        sys.exit(f"{PKG_NAME} is not in {manifest}.\n"
+                 f"Add it yourself (this client never edits your manifest):\n{PINNED_HINT}")
+
+    dep = str(deps[PKG_NAME])
+    if dep.startswith("file:"):
+        sys.exit(f"{PKG_NAME} is pinned as a local path ({dep}).\n"
+                 f"Local paths are a mutable source: the lock records the path, not the\n"
+                 f"content, so this host commit's behaviour drifts with the tool repo and\n"
+                 f"its gates never re-run. Use a SHA-pinned git URL instead:\n{PINNED_HINT}")
+    frag = dep.partition("#")[2]
+    if not SHA40.match(frag):
+        sys.exit(f"{PKG_NAME} must be pinned to a full 40-hex commit SHA; got {dep!r}.\n"
+                 f"{PINNED_HINT}")
 
 
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+SHA40 = re.compile(r"^[0-9a-f]{40}$")
 
 
-def png_dimensions(path: str):
-    """Return (w, h) from the IHDR chunk, or None if this is not a usable PNG."""
+def validate_png(path: str, expect_w: int, expect_h: int):
+    """Walk the whole chunk stream. Checking only the first 24 bytes let a
+    truncated 24-byte stub pass as a real capture -- the same silent false-green
+    this tool exists to kill, reintroduced inside its own fix."""
     try:
         with open(path, "rb") as fh:
-            head = fh.read(24)
-    except OSError:
-        return None
-    if len(head) < 24 or not head.startswith(PNG_MAGIC) or head[12:16] != b"IHDR":
-        return None
-    return int.from_bytes(head[16:20], "big"), int.from_bytes(head[20:24], "big")
+            data = fh.read()
+    except OSError as e:
+        return None, f"unreadable ({e})"
+    if not data.startswith(PNG_MAGIC):
+        return None, "missing PNG signature"
+
+    pos = len(PNG_MAGIC)
+    dims = None
+    seen_idat = seen_iend = False
+    first = True
+    while pos < len(data):
+        if pos + 8 > len(data):
+            return None, f"truncated chunk header at byte {pos}"
+        length = int.from_bytes(data[pos:pos + 4], "big")
+        ctype = data[pos + 4:pos + 8]
+        body_end = pos + 8 + length
+        if body_end + 4 > len(data):
+            return None, f"truncated {ctype.decode('latin1', 'replace')} chunk at byte {pos}"
+        body = data[pos + 8:body_end]
+        want_crc = int.from_bytes(data[body_end:body_end + 4], "big")
+        if zlib.crc32(ctype + body) & 0xFFFFFFFF != want_crc:
+            return None, f"bad CRC on {ctype.decode('latin1', 'replace')} chunk at byte {pos}"
+        if first:
+            if ctype != b"IHDR" or length != 13:
+                return None, "first chunk is not a 13-byte IHDR"
+            dims = (int.from_bytes(body[0:4], "big"), int.from_bytes(body[4:8], "big"))
+            first = False
+        elif ctype == b"IDAT":
+            seen_idat = True
+        pos = body_end + 4
+        if ctype == b"IEND":
+            seen_iend = True
+            break
+
+    if not seen_iend:
+        return None, "no IEND chunk"
+    if pos != len(data):
+        return None, f"{len(data) - pos} trailing bytes after IEND"
+    if not seen_idat:
+        return None, "no IDAT chunk"
+    if dims != (expect_w, expect_h):
+        return None, f"PNG is {dims[0]}x{dims[1]}, expected {expect_w}x{expect_h}"
+    return dims, ""
 
 
 def capture(args: argparse.Namespace) -> int:
@@ -110,13 +169,49 @@ def capture(args: argparse.Namespace) -> int:
     check_package(project)
 
     log = args.log or os.path.join(tempfile.gettempdir(), "agent_bridge_capture.log")
+    out_dir = os.path.dirname(out) or "."
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+    except OSError as e:
+        print(f"[bridge] FAIL: cannot create output directory {out_dir}: {e}")
+        return 15
 
-    # Everything the editor writes goes to a fresh directory owned by THIS call.
-    # Reusing --out directly is how a previous run's PNG gets reported as this
-    # run's success -- the exact silent false-green this tool exists to prevent.
-    workdir = tempfile.mkdtemp(prefix="agent-bridge-")
+    # Serialize on --out so two concurrent captures cannot interleave and publish
+    # one call's PNG next to the other call's JSON.
+    lock_path = out + ".lock"
+    try:
+        lock_fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(lock_fd, f"pid={os.getpid()} started={time.time():.0f}\n".encode())
+        os.close(lock_fd)
+    except FileExistsError:
+        print(f"[bridge] FAIL: {lock_path} exists -- another capture is writing {out}. "
+              f"If no capture is running, delete it.")
+        return 7
+    except OSError as e:
+        print(f"[bridge] FAIL: cannot create lock {lock_path}: {e}")
+        return 7
+
+    # Stage INSIDE the destination directory so the final publish is a same-filesystem
+    # rename. A system-temp staging dir makes any cross-volume --out fail with EXDEV.
+    try:
+        workdir = tempfile.mkdtemp(prefix=".agent-bridge-", dir=out_dir)
+    except OSError as e:
+        os.unlink(lock_path)
+        print(f"[bridge] FAIL: cannot stage next to {out}: {e}")
+        return 15
+
+    try:
+        return _capture_locked(args, project, out, editor, log, workdir)
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+        try:
+            os.unlink(lock_path)
+        except OSError:
+            pass
+
+
+def _capture_locked(args, project: str, out: str, editor: str, log: str, workdir: str) -> int:
     staged = os.path.join(workdir, "capture.png")
-
     cmd = [
         editor,
         "-batchmode",  # deliberately NOT -nographics: capture needs a real GPU
@@ -145,79 +240,97 @@ def capture(args: argparse.Namespace) -> int:
         code = subprocess.run(cmd, timeout=outer, check=False).returncode
     except subprocess.TimeoutExpired:
         print(f"[bridge] FAIL: no exit within {outer}s (outer timeout); editor killed")
-        return finish_failure(4, out, workdir, log, tail=False)
+        return report_untouched(4, out)
     except OSError as e:
         print(f"[bridge] FAIL: could not run editor: {e}")
-        return finish_failure(6, out, workdir, log, tail=False)
+        return report_untouched(6, out)
 
-    ok, reason = validate_run(code, staged, args)
+    ok, reason, result = validate_run(code, staged, args)
     if not ok:
-        meaning = EXIT_MEANINGS.get(code, "unknown")
-        print(f"[bridge] FAIL: {reason} (editor exit {code}: {meaning})")
-        return finish_failure(code if code != 0 else 5, out, workdir, log)
+        print(f"[bridge] FAIL: {reason} (editor exit {code}: {EXIT_MEANINGS.get(code, 'unknown')})")
+        tail_log(log)
+        return report_untouched(code if code != 0 else 5, out)
 
+    # The editor recorded its own staging path; the caller only ever sees --out.
+    result["png"] = out
+    staged_json = staged + ".json"
     try:
-        os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
-        os.replace(staged, out)
-        result_src = staged + ".json"
-        if os.path.isfile(result_src):
-            os.replace(result_src, out + ".json")
+        with open(staged_json, "w", encoding="utf-8") as fh:
+            json.dump(result, fh, ensure_ascii=False)
     except OSError as e:
-        print(f"[bridge] FAIL: could not move capture into place: {e}")
-        return finish_failure(15, out, workdir, log, tail=False)
+        print(f"[bridge] FAIL: could not rewrite result JSON: {e}")
+        return report_untouched(15, out)
 
-    shutil.rmtree(workdir, ignore_errors=True)
-    w, h = png_dimensions(out)
-    print(f"[bridge] OK: {out} ({w}x{h})")
+    # Two renames cannot be one transaction; publish the sidecar first so a failure
+    # on the PNG never leaves fresh metadata describing a stale image.
+    try:
+        os.replace(staged_json, out + ".json")
+    except OSError as e:
+        print(f"[bridge] FAIL: could not publish result JSON: {e}")
+        return report_untouched(15, out)
+    try:
+        os.replace(staged, out)
+    except OSError as e:
+        # Truthful reporting: the sidecar IS already updated at this point.
+        print(f"[bridge] FAIL: could not publish PNG: {e}")
+        print(f"[bridge] NOTE: {out}.json WAS replaced but {out} was not; both are now "
+              f"inconsistent. Delete {out}.json before trusting anything here.")
+        return 15
+
+    dims, why = validate_png(out, args.width, args.height)
+    if dims is None:
+        print(f"[bridge] FAIL: published file failed post-publish validation: {why}")
+        return 5
+    print(f"[bridge] OK: {out} ({dims[0]}x{dims[1]})")
     return 0
 
 
-def validate_run(code: int, staged: str, args: argparse.Namespace):
-    """A run counts as successful only if THIS call produced a matching PNG."""
+def validate_run(code: int, staged: str, args):
+    """Success means THIS call produced a structurally valid PNG matching the request."""
     if code != 0:
-        return False, "editor reported failure"
+        return False, "editor reported failure", None
 
     result_path = staged + ".json"
     if not os.path.isfile(result_path):
-        return False, "editor exited 0 but wrote no result JSON"
+        return False, "editor exited 0 but wrote no result JSON", None
     try:
         with open(result_path, encoding="utf-8") as fh:
             result = json.load(fh)
     except (OSError, json.JSONDecodeError) as e:
-        return False, f"result JSON unreadable ({e})"
+        return False, f"result JSON unreadable ({e})", None
 
     print(f"[bridge] result : {json.dumps(result, ensure_ascii=False)}")
     if result.get("ok") is not True or result.get("exitCode") != 0:
-        return False, "result JSON does not report success"
+        return False, "result JSON does not report success", None
     if result.get("width") != args.width or result.get("height") != args.height:
         return False, (f"result JSON size {result.get('width')}x{result.get('height')} "
-                       f"!= requested {args.width}x{args.height}")
+                       f"!= requested {args.width}x{args.height}"), None
     if args.scene and result.get("scene") != args.scene:
-        return False, f"result JSON scene {result.get('scene')!r} != requested {args.scene!r}"
-
+        return False, f"result JSON scene {result.get('scene')!r} != requested {args.scene!r}", None
+    if os.path.abspath(result.get("png") or "") != os.path.abspath(staged):
+        return False, (f"result JSON png {result.get('png')!r} is not this call's staged "
+                       f"path {staged!r}"), None
     if not os.path.isfile(staged):
-        return False, "result JSON claims success but no PNG was written"
-    dims = png_dimensions(staged)
+        return False, "result JSON claims success but no PNG was written", None
+
+    dims, why = validate_png(staged, args.width, args.height)
     if dims is None:
-        return False, "staged file is not a valid PNG"
-    if dims != (args.width, args.height):
-        return False, f"PNG is {dims[0]}x{dims[1]}, expected {args.width}x{args.height}"
-    return True, ""
+        return False, f"staged PNG rejected: {why}", None
+    return True, "", result
 
 
-def finish_failure(code: int, out: str, workdir: str, log: str, tail: bool = True) -> int:
-    """Clean up this call's artifacts and make any stale --out impossible to mistake."""
-    shutil.rmtree(workdir, ignore_errors=True)
+def report_untouched(code: int, out: str) -> int:
+    """Nothing was published. Make any pre-existing --out impossible to mistake for fresh."""
     if os.path.exists(out):
         try:
-            age = time.time() - os.path.getmtime(out)
-            when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(out)))
+            mtime = os.path.getmtime(out)
+            when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(mtime))
+            mins = (time.time() - mtime) / 60
+            age = f"{when} ({mins:.0f} min ago)"
         except OSError:
-            age, when = -1, "unknown"
-        print(f"[bridge] NOTE: {out} was NOT updated. It is a PREVIOUS capture "
-              f"from {when} ({age / 60:.0f} min ago) -- do not read it as this run's result.")
-    if tail:
-        tail_log(log)
+            age = "unknown time"
+        print(f"[bridge] NOTE: {out} was NOT updated. It is a PREVIOUS capture from {age} "
+              f"-- do not read it as this run's result.")
     return code
 
 
@@ -229,6 +342,65 @@ def tail_log(log: str, want: int = 15) -> None:
         return
     for line in lines[-want:]:
         print(f"  {line}")
+
+
+def build_bad_pngs(w: int, h: int):
+    """The malformed shapes a 24-byte prefix check waved through."""
+    def chunk(ctype: bytes, body: bytes) -> bytes:
+        return (len(body).to_bytes(4, "big") + ctype + body
+                + (zlib.crc32(ctype + body) & 0xFFFFFFFF).to_bytes(4, "big"))
+
+    ihdr_body = w.to_bytes(4, "big") + h.to_bytes(4, "big") + bytes([8, 6, 0, 0, 0])
+    ihdr = chunk(b"IHDR", ihdr_body)
+    raw = b"".join(b"\x00" + b"\x00\x00\x00\xff" * w for _ in range(h))
+    idat = chunk(b"IDAT", zlib.compress(raw))
+    iend = chunk(b"IEND", b"")
+    good = PNG_MAGIC + ihdr + idat + iend
+    bad_crc = bytearray(good)
+    bad_crc[-5] ^= 0xFF
+    return {
+        "empty": b"",
+        "24-byte stub (the exact reported bypass)":
+            PNG_MAGIC + (13).to_bytes(4, "big") + b"IHDR"
+            + w.to_bytes(4, "big") + h.to_bytes(4, "big"),
+        "truncated after IHDR": PNG_MAGIC + ihdr,
+        "no IDAT": PNG_MAGIC + ihdr + iend,
+        "no IEND": PNG_MAGIC + ihdr + idat,
+        "trailing bytes after IEND": good + b"junk",
+        "bad CRC": bytes(bad_crc),
+        "wrong dimensions": PNG_MAGIC + chunk(
+            b"IHDR", (w + 1).to_bytes(4, "big") + h.to_bytes(4, "big") + bytes([8, 6, 0, 0, 0])
+        ) + idat + iend,
+    }, good
+
+
+def selftest(_args) -> int:
+    """Runnable regression for validate_png. No editor, no Unity required."""
+    w, h = 8, 4
+    bad, good = build_bad_pngs(w, h)
+    failures = 0
+    with tempfile.TemporaryDirectory() as td:
+        for name, blob in bad.items():
+            path = os.path.join(td, "x.png")
+            with open(path, "wb") as fh:
+                fh.write(blob)
+            dims, why = validate_png(path, w, h)
+            if dims is not None:
+                print(f"  FAIL rejected-expected but accepted: {name}")
+                failures += 1
+            else:
+                print(f"  ok   rejected {name}: {why}")
+        path = os.path.join(td, "good.png")
+        with open(path, "wb") as fh:
+            fh.write(good)
+        dims, why = validate_png(path, w, h)
+        if dims != (w, h):
+            print(f"  FAIL valid PNG rejected: {why}")
+            failures += 1
+        else:
+            print("  ok   accepted a structurally valid PNG")
+    print(f"selftest: {failures} failure(s)")
+    return 1 if failures else 0
 
 
 def main() -> None:
@@ -247,9 +419,12 @@ def main() -> None:
     cap.add_argument("--min-unique-colors", type=int, default=8)
     cap.add_argument("--editor")
     cap.add_argument("--log")
+    sub.add_parser("selftest", help="run the validate_png regression (no Unity needed)")
     args = top.parse_args()
     if args.cmd == "capture":
         sys.exit(capture(args))
+    if args.cmd == "selftest":
+        sys.exit(selftest(args))
 
 
 if __name__ == "__main__":
