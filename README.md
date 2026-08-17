@@ -75,12 +75,18 @@ python3 Tools~/bridge.py selftest
 | arrows | Game.unity | ✅ 完整画面（HUD / 三心 / 棋盘 / 底部按钮，727 色） |
 | arrows | MainMenu.unity | ✅ 完整画面（纯 canvas UI，460 色） |
 | water_sort | GameScene.unity（默认） | ✅ 开屏 logo（4097 色封顶；拍玩法画面需加大 `--settle-frames`） |
-| meowdoku | Main.unity（默认） | ⚠️ 只出背景色，嵌套内容缺失（见下） |
+| meowdoku | Main.unity（默认） | ⚠️ 只出背景色，嵌套内容缺失 —— **2026-08-18 复测已不复现，见下** |
 
-**已知局限（meowdoku 形态）**：UI 全部由自定义 `Graphic`（`OnPopulateMesh` 程序化网格）构成时，
-canvas 背景 Image 正常渲染但嵌套程序化内容不出，四条路径（临时相机、拉长 settle、原生 640x480、
-正常循环读回）均未解决，根因未定位。颜色门（exit 16）会把这类帧拦下来而不是当成功交付——
-这正是它存在的目的。遇到时先用 `--settle-frames` 排除时序，再怀疑 UI 栈本身。
+**meowdoku 那条限制的现状（2026-08-18 复测）**：在 meowdoku 当时的 `main` 上**复现不出来**了。
+默认关号、`--level 9`、`--level 3` 三次连拍都是完整画面（HUD / 三心 / 规则卡 / 棋盘 / 底部按钮齐全，
+约 2800–3000 色），程序化 `Graphic` 内容正常出现。**根因始终未定位**——上面 08-17 那次也没定位，
+所以说不清是被哪次改动带好的（期间 meowdoku 引入了熊猫贴图与红心贴图，UI 从纯自绘变成自绘 + `Image` 混合）。
+保留这两行是为了留住证据链，不是说它现在坏着。
+
+原始症状记录（08-17）：UI 全部由自定义 `Graphic`（`OnPopulateMesh` 程序化网格）构成时，canvas 背景
+Image 正常渲染但嵌套程序化内容不出，四条路径（临时相机、拉长 settle、原生 640x480、正常循环读回）
+均未解决。**颜色门（exit 16）当时把这类帧拦下来了，没有当成功交付**——那正是它存在的目的。
+再遇到类似形态：先用 `--settle-frames` 排除时序，再怀疑 UI 栈本身。
 
 **arrows Boot 场景提示**：经 Boot 引导拍菜单会拍到卡在纯色 `ScreenTransition` 的帧（exit 16）。
 直接 `--scene Assets/Scenes/MainMenu.unity` 即可。
