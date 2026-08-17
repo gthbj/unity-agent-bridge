@@ -285,26 +285,36 @@ def _capture_locked(args, project: str, out: str, editor: str, log: str, workdir
         print(f"[bridge] FAIL: could not rewrite result JSON: {e}")
         return report_untouched(15, out)
 
-    # Two renames cannot be one transaction; publish the sidecar first so a failure
-    # on the PNG never leaves fresh metadata describing a stale image.
-    try:
-        os.replace(staged_json, out + ".json")
-    except OSError as e:
-        print(f"[bridge] FAIL: could not publish result JSON: {e}")
-        return report_untouched(15, out)
+    # Two renames cannot be one transaction, so publish the PNG first: it is the
+    # artifact the caller actually looks at. Dying between the two then leaves this
+    # run's real image with lagging metadata -- never fresh metadata pointing at a
+    # stale image, which is the failure this tool exists to prevent.
     try:
         os.replace(staged, out)
     except OSError as e:
-        # Truthful reporting: the sidecar IS already updated at this point.
         print(f"[bridge] FAIL: could not publish PNG: {e}")
-        print(f"[bridge] NOTE: {out}.json WAS replaced but {out} was not; both are now "
-              f"inconsistent. Delete {out}.json before trusting anything here.")
-        return 15
+        return report_untouched(15, out)
 
     dims, why = validate_png(out, args.width, args.height)
     if dims is None:
+        # Never leave a file that failed validation sitting at --out looking like a result.
         print(f"[bridge] FAIL: published file failed post-publish validation: {why}")
+        for stale in (out, out + ".json"):
+            try:
+                os.unlink(stale)
+            except OSError:
+                pass
+        print(f"[bridge] NOTE: removed {out} and any stale sidecar; nothing to read here.")
         return 5
+
+    try:
+        os.replace(staged_json, out + ".json")
+    except OSError as e:
+        print(f"[bridge] WARN: PNG published but sidecar JSON was not: {e}")
+        try:
+            os.unlink(out + ".json")
+        except OSError:
+            pass
     print(f"[bridge] OK: {out} ({dims[0]}x{dims[1]})")
     return 0
 
